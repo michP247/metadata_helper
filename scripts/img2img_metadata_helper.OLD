@@ -1,0 +1,325 @@
+# extensions/img2img_metadata_helper/scripts/img2img_metadata_helper.py
+import gradio as gr
+import modules.scripts as scripts
+from modules.images import read_info_from_image
+from modules.infotext_utils import parse_generation_parameters
+from PIL import Image, UnidentifiedImageError
+import json
+import os
+import base64
+from io import BytesIO
+import modules.script_callbacks as script_callbacks
+from fastapi import FastAPI
+# Use InputAccordion conditionally
+try:
+    from modules.ui_components import InputAccordion
+except ImportError:
+    InputAccordion = None # Fallback for older versions
+
+# Import LogicalImage if possible to check its type
+try:
+    # Adjust this path based on your Forge installation if necessary
+    from extensions.sd_forge_canvas.canvas import LogicalImage
+except ImportError:
+    print("[Metadata Helper Warning] Could not import LogicalImage. Will rely on class name check.")
+    LogicalImage = None # Set to None if import fails
+
+
+# --- Python Helper Functions ---
+
+# Keep extract_metadata_from_pil as it's used by the updated on_logical_image_change
+def extract_metadata_from_pil(image_obj: Image.Image):
+    """
+    Extracts metadata directly from a PIL Image object using read_info_from_image.
+    """
+    if image_obj is None:
+        print("[Metadata Helper DEBUG] No image provided.")
+        return {}, "No image provided"
+
+    print("[Metadata Helper DEBUG] Image info:", image_obj.info)
+    print("[Metadata Helper DEBUG] Image format:", getattr(image_obj, 'format', 'unknown'))
+    
+    try:
+        # Try direct parameters from info first
+        if 'parameters' in image_obj.info:
+            print("[Metadata Helper DEBUG] Found parameters directly in original image.info")
+            params = parse_generation_parameters(image_obj.info['parameters'])
+            return params, None
+
+        # If no direct parameters, try read_info_from_image
+        geninfo, _ = read_info_from_image(image_obj)
+        if geninfo:
+            print("[Metadata Helper DEBUG] Found metadata using read_info_from_image")
+            params = parse_generation_parameters(geninfo)
+            return params, None
+
+        # No metadata found
+        print("[Metadata Helper DEBUG] No SD metadata found")
+        return {}, "No metadata found in image"
+
+    except UnidentifiedImageError:
+        print("[Metadata Helper] UnidentifiedImageError during processing.")
+        return {}, "Could not read image format during metadata extraction"
+    except Exception as e:
+        print(f"[Metadata Helper] Error during metadata extraction: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}, f"Error extracting metadata: {e}"
+
+# Keep extract_metadata_from_base64 just in case, though unlikely to be used now
+def extract_metadata_from_base64(base64_str: str):
+    """Decodes base64 and extracts metadata."""
+    # (Implementation from previous step remains unchanged here)
+    if not isinstance(base64_str, str) or not base64_str.startswith('data:image/'):
+        return {}, "Invalid base64 input"
+    try:
+        header, encoded = base64_str.split(',', 1)
+        if not encoded: return {}, "Empty base64 data"
+        image_data = base64.b64decode(encoded)
+        image_stream = BytesIO(image_data)
+        try:
+            image_stream.seek(0)
+            pil_image_for_read_info = Image.open(image_stream)
+            image_stream.seek(0)
+            geninfo, _ = read_info_from_image(pil_image_for_read_info, image_stream)
+        except UnidentifiedImageError:
+             return {}, "Could not read image format"
+        except Exception as e_pil:
+            print(f"[Metadata Helper] Error creating PIL or reading info from base64 stream: {e_pil}")
+            return {}, f"Error processing image data: {e_pil}"
+
+        if geninfo is None: return {}, "No metadata found in image data"
+        params = parse_generation_parameters(geninfo)
+        return params, None
+    except Exception as e:
+        print(f"[Metadata Helper] Error processing base64: {e}")
+        return {}, f"Error processing base64: {e}"
+
+
+# --- Script Class ---
+class Img2ImgMetadataHelperScript(scripts.Script):
+
+    def __init__(self):
+        super().__init__()
+        self.prompt_input = None
+        self.seed_input = None
+        self.neg_prompt_input = None
+        self.background_logical_images = []
+        self.hidden_metadata_store = None
+        print("[Metadata Helper] Script instance initialized (Direct Canvas Listener - PIL approach).") # Updated approach name
+
+    def title(self):
+        return "Image Metadata Helper"
+
+    def show(self, is_img2img):
+        return scripts.AlwaysVisible if is_img2img else False
+
+    # --- UPDATED on_logical_image_change to expect PIL ---
+    def on_logical_image_change(self, image_input): # Expect PIL again
+        """
+        Called when a background LogicalImage component's .input() event fires.
+        Expects a PIL Image directly from Gradio (based on observed behavior).
+        Extracts metadata and returns it to be stored.
+        """
+        print("\n[Metadata Helper DEBUG] ===== Image Change Event =====")
+        print(f"Input type: {type(image_input)}")
+        # Add size check for debugging PIL input
+        if isinstance(image_input, Image.Image):
+            try:
+                print(f"Image format: {getattr(image_input, 'format', 'unknown')}")
+                print(f"Image mode: {image_input.mode}")
+                print(f"Image size: {image_input.size}")
+                print(f"Image info keys: {list(image_input.info.keys())}")
+            except Exception as e:
+                 print(f"!!! Error getting PIL info: {e}")
+        if image_input is None:
+            print("[Metadata Helper] LogicalImage cleared (received None).")
+            return {} # Return empty dict to clear stored metadata
+
+        pil_image = None
+        # Check if the input is actually a PIL Image
+        if isinstance(image_input, Image.Image):
+            pil_image = image_input
+            print("[Metadata Helper] Received PIL image directly from .input() event.")
+        else:
+             # Log if we didn't get a PIL image as now expected
+             print(f"[Metadata Helper Warning] Expected PIL Image from .input(), but received {type(image_input)}. Cannot process.")
+             return {} # Cannot process, return empty
+
+        # If we got a PIL image...
+        if pil_image:
+            # Try extracting metadata using the updated helper function
+            metadata, error = extract_metadata_from_pil(pil_image)
+
+            if error and error not in ["No metadata found in image", "No image provided", "Could not read image format", "Could not read image format from buffer"]:
+                 # Suppress warning if it was likely just an empty image upload (1x1 pixels)
+                 is_likely_empty = False
+                 try: # Protect against errors accessing size
+                      is_likely_empty = pil_image.width <= 1 and pil_image.height <= 1
+                 except Exception: pass
+
+                 if not is_likely_empty:
+                    gr.Warning(f"Metadata Helper: {error}")
+                    print(f"[Metadata Helper Error Extracting Metadata]: {error}")
+
+            # Check if metadata dictionary is actually populated
+            if metadata: # Check if the dictionary itself is not empty
+                 print(f"[Metadata Helper] Storing metadata from canvas (via PIL): {list(metadata.keys())}")
+                 return metadata # <<< Return the dictionary to update the state >>>
+            else:
+                 # No metadata found, or an error occurred during extraction
+                 if error and error != "No image provided": # Avoid logging if just cleared
+                     print(f"[Metadata Helper] No metadata extracted ({error}). Returning empty dict.")
+                 else:
+                     print(f"[Metadata Helper] No metadata extracted. Returning empty dict.")
+                 return {}
+        else:
+            # Should only happen if input wasn't None but also wasn't PIL
+             print("[Metadata Helper] Did not receive a valid PIL image.")
+             return {}
+
+
+    # --- after_component: Identifies LogicalImage with specific class ---
+    # (No changes needed here compared to the previous version)
+    def after_component(self, component, **kwargs):
+        elem_id = kwargs.get("elem_id")
+        elem_classes = kwargs.get("elem_classes", [])
+
+        # Capture target UI fields
+        if elem_id == "img2img_prompt": self.prompt_input = component
+        elif elem_id == "img2img_neg_prompt": self.neg_prompt_input = component
+        elif elem_id == "img2img_seed":
+             self.seed_input = component
+             try:
+                 if hasattr(component, 'interactive'): component.interactive = True
+             except Exception: pass
+
+        # Capture background LogicalImage components
+        component_matches = False
+        if LogicalImage and isinstance(component, LogicalImage): component_matches = True
+        elif not LogicalImage and hasattr(component, '__class__') and component.__class__.__name__ == 'LogicalImage': component_matches = True
+
+        if component_matches and 'logical_image_background' in elem_classes:
+             print(f"[Metadata Helper] Found background LogicalImage component (ID: {elem_id}, Classes: {elem_classes})")
+             self.background_logical_images.append(component)
+
+    # --- ui: Creates UI, binds buttons, binds .input() event ---
+    def ui(self, is_img2img):
+        print(f"[Metadata Helper] Creating UI (is_img2img={is_img2img})")
+        if not is_img2img: return []
+
+        accordion_component = InputAccordion if InputAccordion else gr.Accordion
+
+        with accordion_component(self.title(), open=False) as acc_instance:
+            # 1. Hidden storage
+            self.hidden_metadata_store = gr.State({})
+
+            # 2. Buttons
+            with gr.Row():
+                send_seed_button = gr.Button("Apply Seed from Canvas", variant="secondary")
+                send_prompt_button = gr.Button("Apply Prompt from Canvas", variant="secondary")
+                send_neg_prompt_button = gr.Button("Apply Neg Prompt from Canvas", variant="secondary")
+
+            # 3. Status Label
+            status_label = gr.Markdown("Status: Upload an image to any img2img canvas to read metadata.", visible=True)
+
+            # 4. Helper function for button clicks (with debug prints)
+            def get_value_from_state(key, state_dict, current_value, target_type=None):
+                # --- DEBUG ---
+                print("\n--- Button Click Debug ---")
+                print(f"--- Getting key: '{key}'")
+                print(f"--- Current state_dict type: {type(state_dict)}")
+                print(f"--- Current state_dict value: {state_dict}") # Print the actual dictionary
+                print("--- End Button Click Debug ---\n")
+                # --- END DEBUG ---
+
+                status_message = f"Status: Processing request for '{key}'..."
+                output_value = current_value
+
+                if not isinstance(state_dict, dict) or not state_dict:
+                    status_message = f"Status: No metadata stored. Upload image to a canvas first."
+                    gr.Warning(f"Metadata Helper: No metadata stored. Upload image to a canvas first.")
+                    return output_value, status_message
+
+                value = state_dict.get(key, None)
+
+                if value is not None:
+                    # Shortened log for button click, main log is in the event handler now
+                    # print(f"[Metadata Helper] Applying '{key}' from stored metadata...")
+                    parsed_successfully = False
+                    try:
+                        if target_type == int:
+                            output_value = int(float(value))
+                            parsed_successfully = True
+                        elif target_type == float:
+                            output_value = float(value)
+                            parsed_successfully = True
+                        elif target_type == str:
+                            output_value = str(value).strip()
+                            parsed_successfully = True
+                        else: # No specific type conversion needed
+                            output_value = value
+                            parsed_successfully = True
+
+                        if parsed_successfully:
+                             status_message = f"Status: Applied '{key}'."
+
+                    except (ValueError, TypeError):
+                         warning_msg = f"Metadata Helper: Could not parse '{key}' from metadata ('{value}'). Keeping current value."
+                         gr.Warning(warning_msg)
+                         status_message = f"Warning: Could not parse '{key}' from metadata. Keeping current value."
+                         print(f"[Metadata Helper Warning] {warning_msg}")
+                else:
+                    status_message = f"Status: '{key}' not found in last uploaded image metadata."
+                    gr.Warning(f"Metadata Helper: '{key}' not found in metadata. Upload/drop image with metadata in an img2img canvas.")
+
+                return output_value, status_message
+
+            # 5. Bind button clicks
+            print(f"[Metadata Helper UI Check] Before binding button clicks:")
+            print(f"  - prompt_input: {'OK' if self.prompt_input else 'MISSING'}")
+            print(f"  - seed_input: {'OK' if self.seed_input else 'MISSING'}")
+            print(f"  - neg_prompt_input: {'OK' if self.neg_prompt_input else 'MISSING'}")
+            print(f"  - hidden_metadata_store: {'OK' if self.hidden_metadata_store else 'MISSING'}")
+            print(f"  - Found background_logical_images: {len(self.background_logical_images)}")
+
+            if self.seed_input and self.hidden_metadata_store:
+                send_seed_button.click(fn=lambda state, current: get_value_from_state("Seed", state, current, target_type=int), inputs=[self.hidden_metadata_store, self.seed_input], outputs=[self.seed_input, status_label], queue=False)
+            if self.prompt_input and self.hidden_metadata_store:
+                 send_prompt_button.click(fn=lambda state, current: get_value_from_state("Prompt", state, current, target_type=str), inputs=[self.hidden_metadata_store, self.prompt_input], outputs=[self.prompt_input, status_label], queue=False)
+            if self.neg_prompt_input and self.hidden_metadata_store:
+                 send_neg_prompt_button.click(fn=lambda state, current: get_value_from_state("Negative prompt", state, current, target_type=str), inputs=[self.hidden_metadata_store, self.neg_prompt_input], outputs=[self.neg_prompt_input, status_label], queue=False)
+
+            # 6. Bind the .input() event for ALL found background LogicalImage components
+            bound_count = 0
+            if self.hidden_metadata_store:
+                for bg_logical_image in self.background_logical_images:
+                    if bg_logical_image:
+                        try:
+                            bg_logical_image.input( # Keep using .input()
+                                fn=self.on_logical_image_change,
+                                inputs=[bg_logical_image],
+                                outputs=[self.hidden_metadata_store]
+                            )
+                            bound_count += 1
+                        except Exception as e:
+                            print(f"[Metadata Helper ERROR] Failed to bind input event for a background LogicalImage: {e}")
+
+            print(f"[Metadata Helper] Bound input event for {bound_count} background LogicalImage components.")
+            if bound_count == 0:
+                 print("[Metadata Helper WARNING] No background LogicalImage components were found or bound.")
+                 status_label.update(value="Warning: Could not find Forge canvas components to listen to.")
+
+
+        # Return controls created by the UI function
+        if InputAccordion:
+             return [acc_instance]
+        else:
+             return [send_seed_button, send_prompt_button, send_neg_prompt_button, status_label]
+
+
+# --- Keep the on_app_started callback ---
+def on_app_started(demo: gr.Blocks, app: FastAPI):
+    print("[Metadata Helper] Extension script loaded (Direct Canvas Listener - PIL approach).") # Updated approach name
+
+script_callbacks.on_app_started(on_app_started)
