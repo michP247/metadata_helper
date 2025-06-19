@@ -15,16 +15,12 @@ class Img2ImgMetadataHelperScript(scripts.Script):
     def __init__(self):
         super().__init__()
         self.is_target_instance = False
-        # --- UI Element References ---
         self.prompt_input = None
         self.seed_input = None
         self.neg_prompt_input = None
         self.hidden_metadata_store = None
         self.display_extracted_prompt = None
-        # --- Canvas Component Storage ---
-        # We will store the canvas components we find here.
         self.canvas_background_components = []
-        print("[Metadata Helper] Script instance initialized.")
 
     def title(self):
         return "Image Metadata Helper"
@@ -35,35 +31,22 @@ class Img2ImgMetadataHelperScript(scripts.Script):
             return scripts.AlwaysVisible
         return False
 
-    def on_canvas_image_change(self, pil_image: Image.Image):
-        """Called when a canvas is updated. Receives a PIL Image directly."""
-        print("\n--- [Metadata Helper] Canvas Image Change Detected ---")
+    def _extract_metadata(self, pil_image: Image.Image):
+        """Extracts metadata from a PIL Image, returning a dict and the raw prompt."""
         if not isinstance(pil_image, Image.Image):
-            print("[Metadata Helper] Canvas cleared or invalid data. Resetting.")
             return {}, ""
-
-        print(f"[Metadata Helper] Received PIL Image. Size: {pil_image.size}, Mode: {pil_image.mode}")
         try:
             geninfo, _ = read_info_from_image(pil_image)
             if geninfo is None:
-                print("[Metadata Helper] No PNG metadata found in image.")
                 return {}, ""
             params = parse_generation_parameters(geninfo)
-            print(f"[Metadata Helper] Extracted metadata keys: {list(params.keys())}")
-            extracted_prompt = params.get("Prompt", "")
-            return params, extracted_prompt
-        except Exception as e:
-            print(f"[Metadata Helper] Error reading metadata: {e}")
+            return params, params.get("Prompt", "")
+        except Exception:
             return {}, ""
 
-    def _apply_modified_prompt(self, state_dict, remove_str, add_str):
-        """Applies modifications to the extracted prompt."""
-        if not isinstance(state_dict, dict) or not state_dict:
-            gr.Warning("Metadata Helper: No metadata loaded. Upload an image first.")
-            return ""
-        
-        original_prompt = state_dict.get("Prompt", "")
-        modified_prompt = original_prompt
+    def _modify_prompt(self, original_prompt, remove_str, add_str):
+        """Applies string modifications to a prompt."""
+        modified_prompt = original_prompt or ""
 
         if remove_str:
             words_to_remove = [word.strip() for word in remove_str.split(',') if word.strip()]
@@ -71,9 +54,8 @@ class Img2ImgMetadataHelperScript(scripts.Script):
                 escaped_word = re.escape(word)
                 is_standard_word = word and word[0].isalnum() and word[-1].isalnum()
                 pattern = r'\b' + escaped_word + r'\b' if is_standard_word else escaped_word
-                # This regex logic handles commas and spacing around the word to remove.
+
                 modified_prompt = re.sub(r'(,\s*|^)' + pattern + r'(\s*,|$)', r'\1\2', modified_prompt, flags=re.IGNORECASE)
-            # Clean up leftover commas
             modified_prompt = re.sub(r'^,', '', re.sub(r',,', ',', modified_prompt.strip())).strip()
 
         if add_str:
@@ -83,8 +65,24 @@ class Img2ImgMetadataHelperScript(scripts.Script):
         
         return modified_prompt
 
+    def on_canvas_image_change(self, pil_image, auto_apply, remove_str, add_str):
+        """
+        Main callback when a canvas image is uploaded.
+        It extracts metadata and, if auto-apply is checked, modifies and applies the prompt.
+        """
+        metadata, extracted_prompt = self._extract_metadata(pil_image)
+        
+        if not metadata:
+            return {}, "", gr.update() # Reset helper, don't touch main prompt
+
+        if auto_apply:
+            modified_prompt = self._modify_prompt(extracted_prompt, remove_str, add_str)
+            return metadata, extracted_prompt, modified_prompt
+        else:
+            return metadata, extracted_prompt, gr.update() # Update helper, don't touch main prompt
+
     def after_component(self, component, **kwargs):
-        """Finds UI elements and stores them for later processing in ui()."""
+        """Finds and stores references to relevant UI components."""
         if not self.is_target_instance:
             return
 
@@ -95,14 +93,11 @@ class Img2ImgMetadataHelperScript(scripts.Script):
 
         elem_classes = kwargs.get("elem_classes")
         if elem_classes and 'logical_image_background' in elem_classes and isinstance(component, gr.Textbox):
-            # Store the found canvas component instead of binding immediately.
             self.canvas_background_components.append(component)
-            print(f"[Metadata Helper] Found and stored canvas component: {kwargs.get('elem_id')}")
 
     def ui(self, is_img2img):
-        """Creates the script's UI and binds events now that all components exist."""
+        """Creates the script's UI and binds all events."""
         accordion_component = InputAccordion if InputAccordion else gr.Accordion
-        # This list will be the return value of the function.
         all_created_components = []
 
         with accordion_component(label=self.title(), open=True) as acc:
@@ -112,14 +107,15 @@ class Img2ImgMetadataHelperScript(scripts.Script):
             self.hidden_metadata_store = gr.State({})
             
             with gr.Group():
-                md = gr.Markdown("**Drag an image onto the main `img2img` canvas above to automatically load its metadata here.**")
+                md = gr.Markdown("**Drag an image onto the main `img2img` canvas to load its metadata.**")
                 if not InputAccordion: all_created_components.append(md)
 
             with gr.Column():
+                auto_apply_checkbox = gr.Checkbox(label="Automatically apply modified prompt on upload", value=False)
                 self.display_extracted_prompt = gr.Textbox(label="Extracted Prompt (read-only)", interactive=False, lines=3)
                 prompt_remove_words = gr.Textbox(label="Remove words/phrases (comma-separated)")
                 prompt_add_words = gr.Textbox(label="Add words/phrases to end (comma-separated)")
-                if not InputAccordion: all_created_components.extend([self.display_extracted_prompt, prompt_remove_words, prompt_add_words])
+                if not InputAccordion: all_created_components.extend([auto_apply_checkbox, self.display_extracted_prompt, prompt_remove_words, prompt_add_words])
 
             with gr.Row():
                 send_seed_button = gr.Button("Apply Seed", variant="secondary")
@@ -127,21 +123,18 @@ class Img2ImgMetadataHelperScript(scripts.Script):
                 send_neg_prompt_button = gr.Button("Apply Neg Prompt", variant="secondary")
                 if not InputAccordion: all_created_components.extend([send_seed_button, send_prompt_button, send_neg_prompt_button])
 
-        # --- NOW BIND THE EVENTS ---
-        # At this point, all our UI components (self.hidden_metadata_store, etc.)
-        # and the canvas components (stored in the list) are guaranteed to exist.
+        # Bind canvas change events after all components are defined.
         for canvas_comp in self.canvas_background_components:
             canvas_comp.change(
                 fn=self.on_canvas_image_change,
-                inputs=[canvas_comp],
-                outputs=[self.hidden_metadata_store, self.display_extracted_prompt],
+                inputs=[canvas_comp, auto_apply_checkbox, prompt_remove_words, prompt_add_words],
+                outputs=[self.hidden_metadata_store, self.display_extracted_prompt, self.prompt_input],
                 queue=False
             )
-        print(f"[Metadata Helper] Successfully bound change events for {len(self.canvas_background_components)} canvas components.")
 
         def get_value_from_state(key, state_dict, current_value, target_type=None):
             if not isinstance(state_dict, dict) or not state_dict:
-                gr.Warning(f"Metadata Helper: No metadata loaded. Upload image first.")
+                gr.Warning("Metadata Helper: No metadata loaded. Upload image first.")
                 return current_value
             value = state_dict.get(key)
             if value is not None:
@@ -156,7 +149,7 @@ class Img2ImgMetadataHelperScript(scripts.Script):
             inputs=[self.hidden_metadata_store, self.seed_input], outputs=[self.seed_input], queue=False
         )
         send_prompt_button.click(
-            fn=self._apply_modified_prompt,
+            fn=lambda state, remove, add: self._modify_prompt(state.get("Prompt",""), remove, add),
             inputs=[self.hidden_metadata_store, prompt_remove_words, prompt_add_words],
             outputs=[self.prompt_input], queue=False
         )
@@ -169,6 +162,6 @@ class Img2ImgMetadataHelperScript(scripts.Script):
         return all_created_components
 
 def on_app_started(demo, app):
-    print("[Metadata Helper] Extension script loaded (Final Revised Version).")
+    pass # No startup action needed
 
 script_callbacks.on_app_started(on_app_started)
