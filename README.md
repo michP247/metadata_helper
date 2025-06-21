@@ -9,4 +9,4 @@ Use the "Remove" and "Add" textboxes to prepare your changes.
 
 Click Apply Modified Prompt, Apply Seed, or Apply Neg Prompt to send the data to the main UI fields.
 
-Alternatively, you can auto-apply the prompt when uploading an image
+Alternatively, you can auto-apply the prompt and/or seed when uploading an image
